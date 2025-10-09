@@ -80,16 +80,32 @@ new_client () {
 	sed -ne '/BEGIN OpenVPN Static key/,$ p' /etc/openvpn/server/tc.key
 	echo "</tls-crypt>"
 	} > ~/"$1".ovpn
-	useradd $1
-    google-authenticator -t -d -r3 -R30 -f -l $1-vpn -s /etc/openvpn/google-authenticator/$1
-    chown gauth. /etc/openvpn/google-authenticator/$1
+	
+	# Only set up 2FA if enabled
+	if [[ "$ENABLE_2FA" == "true" ]]; then
+		useradd $1 2>/dev/null
+		google-authenticator -t -d -r3 -R30 -f -l $1-vpn -s /etc/openvpn/google-authenticator/$1
+		chown gauth. /etc/openvpn/google-authenticator/$1
+	fi
 }
 
 if [[ -e /etc/openvpn/server/server.conf ]]; then
+	# Check if 2FA is enabled in existing setup
+	if grep -q "plugin.*openvpn-plugin-auth-pam.so" /etc/openvpn/server/server.conf; then
+		ENABLE_2FA="true"
+	else
+		ENABLE_2FA="false"
+	fi
+	
 	while :
 	do
 	clear
 		echo "Looks like OpenVPN is already installed."
+		if [[ "$ENABLE_2FA" == "true" ]]; then
+			echo "(2FA is ENABLED)"
+		else
+			echo "(2FA is DISABLED - Certificate-only authentication)"
+		fi
 		echo
 		echo "What do you want to do?"
 		echo "   1) Add a new user"
@@ -118,6 +134,15 @@ if [[ -e /etc/openvpn/server/server.conf ]]; then
 			new_client "$client"
 			echo
 			echo "Client $client added, configuration is available at:" ~/"$client.ovpn"
+			if [[ "$ENABLE_2FA" == "true" ]]; then
+				echo
+				echo "IMPORTANT: 2FA is enabled. Your Google Authenticator secret is stored in:"
+				echo "/etc/openvpn/google-authenticator/$client"
+				echo
+				echo "When connecting, use:"
+				echo "  Username: $client"
+				echo "  Password: [6-digit code from your authenticator app]"
+			fi
 			exit
 			;;
 			2)
@@ -155,6 +180,11 @@ if [[ -e /etc/openvpn/server/server.conf ]]; then
 				cp /etc/openvpn/server/easy-rsa/pki/crl.pem /etc/openvpn/server/crl.pem
 				# CRL is read with each client connection, when OpenVPN is dropped to nobody
 				chown nobody:"$group_name" /etc/openvpn/server/crl.pem
+				# Clean up 2FA files if they exist
+				if [[ -f /etc/openvpn/google-authenticator/"$client" ]]; then
+					rm -f /etc/openvpn/google-authenticator/"$client"
+				fi
+				userdel "$client" 2>/dev/null
 				echo
 				echo "Certificate for client $client revoked!"
 			else
@@ -191,6 +221,7 @@ if [[ -e /etc/openvpn/server/server.conf ]]; then
 				fi
 				systemctl disable --now openvpn-server@server.service
 				rm -rf /etc/openvpn/server
+				rm -rf /etc/openvpn/google-authenticator
 				rm -f /etc/systemd/system/openvpn-server@server.service.d/disable-limitnproc.conf
 				rm -f /etc/sysctl.d/30-openvpn-forward.conf
 				if [[ "$os" == "debian" ]] || [[ "$os" == "ubuntu-20.04" ]]; then
@@ -277,6 +308,27 @@ else
 		read -p "DNS [1]: " dns
 	done
 	echo
+	echo "Do you want to enable Two-Factor Authentication (2FA)?"
+	echo "   1) No - Certificate only (recommended for personal use, simpler)"
+	echo "   2) Yes - Certificate + Google Authenticator (maximum security)"
+	echo
+	echo "Note: If you choose 2FA, you'll need a mobile authenticator app."
+	read -p "Enable 2FA? [1]: " enable_2fa_choice
+	until [[ -z "$enable_2fa_choice" || "$enable_2fa_choice" =~ ^[12]$ ]]; do
+		echo "$enable_2fa_choice: invalid selection."
+		read -p "Enable 2FA? [1]: " enable_2fa_choice
+	done
+	case "$enable_2fa_choice" in
+		2)
+		ENABLE_2FA="true"
+		echo "2FA will be enabled. You'll need to scan QR codes or enter secret keys manually."
+		;;
+		1|"")
+		ENABLE_2FA="false"
+		echo "2FA disabled. Using certificate-only authentication."
+		;;
+	esac
+	echo
 	echo "Finally, tell me a name for the client certificate."
 	read -p "Client name [client]: " unsanitized_client
 	# Allow a limited set of characters to avoid conflicts
@@ -294,34 +346,44 @@ LimitNPROC=infinity" > /etc/systemd/system/openvpn-server@server.service.d/disab
 	if [[ "$os" = "debian" ]]; then
 		apt-get update
 		apt-get install openvpn iptables openssl ca-certificates -y
-		apt-get install libqrencode3 libpam-google-authenticator -y
-		# Google Authenticator configuration
-	    addgroup gauth
-	    useradd -g gauth gauth
+		if [[ "$ENABLE_2FA" == "true" ]]; then
+			apt-get install libqrencode3 libpam-google-authenticator -y
+			addgroup gauth
+			useradd -g gauth gauth
+		fi
 	elif [[ "$os" == "ubuntu-20.04" ]]; then
 		apt-get update
 		apt-get install openvpn iptables openssl ca-certificates -y
-		apt-get install libqrencode4 libpam-google-authenticator -y
-		# Google Authenticator configuration
-		addgroup gauth
-		useradd -g gauth gauth
+		if [[ "$ENABLE_2FA" == "true" ]]; then
+			apt-get install libqrencode4 libpam-google-authenticator -y
+			addgroup gauth
+			useradd -g gauth gauth
+		fi
 	elif [[ "$os" == "amazon-linux" ]]; then
 		amazon-linux-extras install epel -y
 		yum install openvpn iptables openssl ca-certificates tar -y
-		yum install google-authenticator -y
-		groupadd gauth
-	    adduser -g gauth gauth
+		if [[ "$ENABLE_2FA" == "true" ]]; then
+			yum install google-authenticator -y
+			groupadd gauth
+			adduser -g gauth gauth
+		fi
 	else
 		# Else, the distro is CentOS
 		yum install epel-release -y
 		yum install openvpn iptables openssl ca-certificates tar -y
-		yum install google-authenticator -y
-		groupadd gauth
-	    adduser -g gauth gauth
+		if [[ "$ENABLE_2FA" == "true" ]]; then
+			yum install google-authenticator -y
+			groupadd gauth
+			adduser -g gauth gauth
+		fi
 	fi
-    mkdir /etc/openvpn/google-authenticator
-    chown gauth:gauth /etc/openvpn/google-authenticator
-    chmod 0700 /etc/openvpn/google-authenticator
+	
+	if [[ "$ENABLE_2FA" == "true" ]]; then
+		mkdir -p /etc/openvpn/google-authenticator
+		chown gauth:gauth /etc/openvpn/google-authenticator
+		chmod 0700 /etc/openvpn/google-authenticator
+	fi
+	
 	# Get easy-rsa
 	easy_rsa_url='https://github.com/OpenVPN/easy-rsa/releases/download/v3.0.5/EasyRSA-nix-3.0.5.tgz'
 	wget -O ~/easyrsa.tgz "$easy_rsa_url" 2>/dev/null || curl -Lo ~/easyrsa.tgz "$easy_rsa_url"
@@ -412,68 +474,21 @@ crl-verify crl.pem" >> /etc/openvpn/server/server.conf
 	if [[ "$protocol" = "udp" ]]; then
 		echo "explicit-exit-notify" >> /etc/openvpn/server/server.conf
 	fi
-	# Authenticator config
-	mkdir -p /usr/lib/openvpn/
-	if [[ "$os" == "debian" ]] || [[ "$os" == "ubuntu-20.04" ]]; then
-		echo "plugin /usr/lib/openvpn/openvpn-plugin-auth-pam.so openvpn" >> /etc/openvpn/server/server.conf
-		ln -s /usr/lib/x86_64-linux-gnu/openvpn/plugins/openvpn-plugin-auth-pam.so /usr/lib/openvpn/openvpn-plugin-auth-pam.so
-		echo "auth required /lib/x86_64-linux-gnu/security/pam_google_authenticator.so secret=/etc/openvpn/google-authenticator/\${USER} user=gauth forward_pass" > /etc/pam.d/openvpn
-	else
-		# Else, the distro is CentOS or Amazon Linux
-		yum install perl-Authen-PAM -y
-		echo "auth-user-pass-verify auth-pam.pl via-file
-script-security 2" >> /etc/openvpn/server/server.conf
-		echo "#!/usr/bin/perl -t
-use Authen::PAM;
-use POSIX;
-sub my_conv_func {
-    my @res;
-    while ( @_ ) {
-        my \$code = shift;
-        my \$msg = shift;
-        my \$ans = \"\";
-
-        \$ans = \$password if \$msg =~ /[Pp]assword/;
-
-        push @res, (PAM_SUCCESS(),\$ans);
-    }
-    push @res, PAM_SUCCESS();
-    return @res;
-}
-\$service = \"openvpn\";
-if (\$ARG = shift @ARGV) {
-    if (!open (UPFILE, \"<\$ARG\")) {
-	print \"Could not open username/password file: \$ARG\n\";
-	exit 1;
-    }
-} else {
-    print \"No username/password file specified on command line\n\";
-    exit 1;
-}
-\$username = <UPFILE>;
-\$password = <UPFILE>;
-if (!\$username || !\$password) {
-    print \"Username/password not found in file: \$ARG\n\";
-    exit 1;
-}
-chomp \$username;
-chomp \$password;
-close (UPFILE);
-if (!ref(\$pamh = new Authen::PAM(\$service, \$username, \&my_conv_func))) {
-    print \"Authen::PAM init failed\n\";
-    exit 1;
-}
-\$res = \$pamh->pam_authenticate;
-if (\$res == PAM_SUCCESS()) {
-    exit 0;
-} else {
-    print \"Auth '\$username' failed, PAM said: \", \$pamh->pam_strerror($res), \"\n\";
-    exit 1;
-}" > /etc/openvpn/server/auth-pam.pl
-		chown nobody. /etc/openvpn/server/auth-pam.pl
-		chmod 755 /etc/openvpn/server/auth-pam.pl
-		echo "auth required /usr/lib64/security/pam_google_authenticator.so secret=/etc/openvpn/google-authenticator/\${USER} user=gauth forward_pass" > /etc/pam.d/openvpn
+	
+	# Only add PAM authentication if 2FA is enabled
+	if [[ "$ENABLE_2FA" == "true" ]]; then
+		mkdir -p /usr/lib/openvpn/
+		if [[ "$os" == "debian" ]] || [[ "$os" == "ubuntu-20.04" ]]; then
+			echo "plugin /usr/lib/openvpn/openvpn-plugin-auth-pam.so openvpn" >> /etc/openvpn/server/server.conf
+			ln -s /usr/lib/x86_64-linux-gnu/openvpn/plugins/openvpn-plugin-auth-pam.so /usr/lib/openvpn/openvpn-plugin-auth-pam.so
+			echo "auth required /lib/x86_64-linux-gnu/security/pam_google_authenticator.so secret=/etc/openvpn/google-authenticator/\${USER} user=gauth forward_pass" > /etc/pam.d/openvpn
+		else
+			# CentOS or Amazon Linux - use native PAM plugin
+			echo "plugin /usr/lib64/openvpn/plugins/openvpn-plugin-auth-pam.so openvpn" >> /etc/openvpn/server/server.conf
+			echo "auth required pam_google_authenticator.so secret=/etc/openvpn/google-authenticator/\${USER} user=gauth forward_pass" > /etc/pam.d/openvpn
+		fi
 	fi
+	
 	# Enable net.ipv4.ip_forward for the system
 	echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/30-openvpn-forward.conf
 	# Enable without waiting for a reboot or service restart
@@ -491,16 +506,18 @@ if (\$res == PAM_SUCCESS()) {
 		firewall-cmd --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
 		firewall-cmd --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
 	else
+		# Detect network interface dynamically
+		default_interface=$(ip route | grep default | awk '{print $5}' | head -n1)
 		# Create a service to set up persistent iptables rules
 		echo "[Unit]
 Before=network.target
 [Service]
 Type=oneshot
-ExecStart=/sbin/iptables -t nat -A POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $ip
+ExecStart=/sbin/iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o $default_interface -j MASQUERADE
 ExecStart=/sbin/iptables -I INPUT -p $protocol --dport $port -j ACCEPT
 ExecStart=/sbin/iptables -I FORWARD -s 10.8.0.0/24 -j ACCEPT
 ExecStart=/sbin/iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-ExecStop=/sbin/iptables -t nat -D POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $ip
+ExecStop=/sbin/iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -o $default_interface -j MASQUERADE
 ExecStop=/sbin/iptables -D INPUT -p $protocol --dport $port -j ACCEPT
 ExecStop=/sbin/iptables -D FORWARD -s 10.8.0.0/24 -j ACCEPT
 ExecStop=/sbin/iptables -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
@@ -538,8 +555,13 @@ remote-cert-tls server
 auth SHA512
 cipher AES-256-CBC
 verb 3
-reneg-sec 28800
-auth-user-pass" > /etc/openvpn/server/client-common.txt
+reneg-sec 28800" > /etc/openvpn/server/client-common.txt
+	
+	# Only add auth-user-pass if 2FA is enabled
+	if [[ "$ENABLE_2FA" == "true" ]]; then
+		echo "auth-user-pass" >> /etc/openvpn/server/client-common.txt
+	fi
+	
 	# Enable and start the OpenVPN service
 	systemctl enable --now openvpn-server@server.service
 	# Generates the custom client.ovpn
@@ -548,5 +570,25 @@ auth-user-pass" > /etc/openvpn/server/client-common.txt
 	echo "Finished!"
 	echo
 	echo "Your client configuration is available at:" ~/"$client.ovpn"
+	if [[ "$ENABLE_2FA" == "true" ]]; then
+		echo
+		echo "================================================"
+		echo "IMPORTANT: 2FA is ENABLED"
+		echo "================================================"
+		echo "Your Google Authenticator secret is stored in:"
+		echo "/etc/openvpn/google-authenticator/$client"
+		echo
+		echo "When connecting to VPN, you'll need:"
+		echo "  Username: $client"
+		echo "  Password: [6-digit code from your authenticator app]"
+		echo
+		echo "Add the secret to your authenticator app (Google Authenticator, Authy, etc.)"
+		echo "================================================"
+	else
+		echo
+		echo "Certificate-only authentication is configured."
+		echo "Simply import the .ovpn file to connect - no password needed."
+	fi
+	echo
 	echo "If you want to add more clients, just run this script again!"
 fi
