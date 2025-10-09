@@ -1,50 +1,41 @@
 #!/bin/bash
-
 if grep -qs "14.04" /etc/os-release; then
 	echo "Ubuntu 14.04 is too old and not supported"
 	exit
 fi
-
 if grep -qs "jessie" /etc/os-release; then
 	echo "Debian 8 is too old and not supported"
 	exit
 fi
-
 if grep -qs "CentOS release 6" /etc/redhat-release; then
 	echo "CentOS 6 is too old and not supported"
 	exit
 fi
-
 if grep -qs "Ubuntu 16.04" /etc/os-release; then
 	echo 'Ubuntu 16.04 is no longer supported in the current version of openvpn-install
 Use an older version if Ubuntu 16.04 support is needed: https://git.io/vpn1604'
 	exit
 fi
-
 # Detect Debian users running the script with "sh" instead of bash
 if readlink /proc/$$/exe | grep -q "dash"; then
 	echo "This script needs to be run with bash, not sh"
 	exit
 fi
-
 if [[ "$EUID" -ne 0 ]]; then
 	echo "Sorry, you need to run this as root"
 	exit
 fi
-
 if [[ ! -e /dev/net/tun ]]; then
 	echo "The TUN device is not available
 You need to enable TUN before running this script"
 	exit
 fi
-
 if ! iptables -t nat -nL &>/dev/null; then
 	echo "Unable to initialize the iptables/netfilter NAT table, setup can't continue.
 Make sure that your system has iptables/netfilter available.
 If using OpenVZ, ask your provider to enable full netfilter support."
 	exit
 fi
-
 if [[ -e /etc/debian_version ]]; then
 	group_name="nogroup"
 	if grep -qs "20.04" /etc/os-release; then
@@ -62,7 +53,6 @@ else
 	echo "Looks like you aren't running this installer on Debian, Ubuntu, CentOS or Amazon Linux"
 	exit
 fi
-
 new_client () {
 	# Generates the custom client.ovpn
 	{
@@ -80,11 +70,7 @@ new_client () {
 	sed -ne '/BEGIN OpenVPN Static key/,$ p' /etc/openvpn/server/tc.key
 	echo "</tls-crypt>"
 	} > ~/"$1".ovpn
-	useradd $1
-    google-authenticator -t -d -r3 -R30 -f -l $1-vpn -s /etc/openvpn/google-authenticator/$1
-    chown gauth. /etc/openvpn/google-authenticator/$1
 }
-
 if [[ -e /etc/openvpn/server/server.conf ]]; then
 	while :
 	do
@@ -294,34 +280,17 @@ LimitNPROC=infinity" > /etc/systemd/system/openvpn-server@server.service.d/disab
 	if [[ "$os" = "debian" ]]; then
 		apt-get update
 		apt-get install openvpn iptables openssl ca-certificates -y
-		apt-get install libqrencode3 libpam-google-authenticator -y
-		# Google Authenticator configuration
-	    addgroup gauth
-	    useradd -g gauth gauth
 	elif [[ "$os" == "ubuntu-20.04" ]]; then
 		apt-get update
 		apt-get install openvpn iptables openssl ca-certificates -y
-		apt-get install libqrencode4 libpam-google-authenticator -y
-		# Google Authenticator configuration
-		addgroup gauth
-		useradd -g gauth gauth
 	elif [[ "$os" == "amazon-linux" ]]; then
 		amazon-linux-extras install epel -y
 		yum install openvpn iptables openssl ca-certificates tar -y
-		yum install google-authenticator -y
-		groupadd gauth
-	    adduser -g gauth gauth
 	else
 		# Else, the distro is CentOS
 		yum install epel-release -y
 		yum install openvpn iptables openssl ca-certificates tar -y
-		yum install google-authenticator -y
-		groupadd gauth
-	    adduser -g gauth gauth
 	fi
-    mkdir /etc/openvpn/google-authenticator
-    chown gauth:gauth /etc/openvpn/google-authenticator
-    chmod 0700 /etc/openvpn/google-authenticator
 	# Get easy-rsa
 	easy_rsa_url='https://github.com/OpenVPN/easy-rsa/releases/download/v3.0.5/EasyRSA-nix-3.0.5.tgz'
 	wget -O ~/easyrsa.tgz "$easy_rsa_url" 2>/dev/null || curl -Lo ~/easyrsa.tgz "$easy_rsa_url"
@@ -412,68 +381,6 @@ crl-verify crl.pem" >> /etc/openvpn/server/server.conf
 	if [[ "$protocol" = "udp" ]]; then
 		echo "explicit-exit-notify" >> /etc/openvpn/server/server.conf
 	fi
-	# Authenticator config
-	mkdir -p /usr/lib/openvpn/
-	if [[ "$os" == "debian" ]] || [[ "$os" == "ubuntu-20.04" ]]; then
-		echo "plugin /usr/lib/openvpn/openvpn-plugin-auth-pam.so openvpn" >> /etc/openvpn/server/server.conf
-		ln -s /usr/lib/x86_64-linux-gnu/openvpn/plugins/openvpn-plugin-auth-pam.so /usr/lib/openvpn/openvpn-plugin-auth-pam.so
-		echo "auth required /lib/x86_64-linux-gnu/security/pam_google_authenticator.so secret=/etc/openvpn/google-authenticator/\${USER} user=gauth forward_pass" > /etc/pam.d/openvpn
-	else
-		# Else, the distro is CentOS or Amazon Linux
-		yum install perl-Authen-PAM -y
-		echo "auth-user-pass-verify auth-pam.pl via-file
-script-security 2" >> /etc/openvpn/server/server.conf
-		echo "#!/usr/bin/perl -t
-use Authen::PAM;
-use POSIX;
-sub my_conv_func {
-    my @res;
-    while ( @_ ) {
-        my \$code = shift;
-        my \$msg = shift;
-        my \$ans = \"\";
-
-        \$ans = \$password if \$msg =~ /[Pp]assword/;
-
-        push @res, (PAM_SUCCESS(),\$ans);
-    }
-    push @res, PAM_SUCCESS();
-    return @res;
-}
-\$service = \"openvpn\";
-if (\$ARG = shift @ARGV) {
-    if (!open (UPFILE, \"<\$ARG\")) {
-	print \"Could not open username/password file: \$ARG\n\";
-	exit 1;
-    }
-} else {
-    print \"No username/password file specified on command line\n\";
-    exit 1;
-}
-\$username = <UPFILE>;
-\$password = <UPFILE>;
-if (!\$username || !\$password) {
-    print \"Username/password not found in file: \$ARG\n\";
-    exit 1;
-}
-chomp \$username;
-chomp \$password;
-close (UPFILE);
-if (!ref(\$pamh = new Authen::PAM(\$service, \$username, \&my_conv_func))) {
-    print \"Authen::PAM init failed\n\";
-    exit 1;
-}
-\$res = \$pamh->pam_authenticate;
-if (\$res == PAM_SUCCESS()) {
-    exit 0;
-} else {
-    print \"Auth '\$username' failed, PAM said: \", \$pamh->pam_strerror($res), \"\n\";
-    exit 1;
-}" > /etc/openvpn/server/auth-pam.pl
-		chown nobody. /etc/openvpn/server/auth-pam.pl
-		chmod 755 /etc/openvpn/server/auth-pam.pl
-		echo "auth required /usr/lib64/security/pam_google_authenticator.so secret=/etc/openvpn/google-authenticator/\${USER} user=gauth forward_pass" > /etc/pam.d/openvpn
-	fi
 	# Enable net.ipv4.ip_forward for the system
 	echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/30-openvpn-forward.conf
 	# Enable without waiting for a reboot or service restart
@@ -491,16 +398,18 @@ if (\$res == PAM_SUCCESS()) {
 		firewall-cmd --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
 		firewall-cmd --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
 	else
+		# Detect network interface dynamically
+		default_interface=$(ip route | grep default | awk '{print $5}' | head -n1)
 		# Create a service to set up persistent iptables rules
 		echo "[Unit]
 Before=network.target
 [Service]
 Type=oneshot
-ExecStart=/sbin/iptables -t nat -A POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $ip
+ExecStart=/sbin/iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o $default_interface -j MASQUERADE
 ExecStart=/sbin/iptables -I INPUT -p $protocol --dport $port -j ACCEPT
 ExecStart=/sbin/iptables -I FORWARD -s 10.8.0.0/24 -j ACCEPT
 ExecStart=/sbin/iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-ExecStop=/sbin/iptables -t nat -D POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $ip
+ExecStop=/sbin/iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -o $default_interface -j MASQUERADE
 ExecStop=/sbin/iptables -D INPUT -p $protocol --dport $port -j ACCEPT
 ExecStop=/sbin/iptables -D FORWARD -s 10.8.0.0/24 -j ACCEPT
 ExecStop=/sbin/iptables -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
@@ -538,8 +447,7 @@ remote-cert-tls server
 auth SHA512
 cipher AES-256-CBC
 verb 3
-reneg-sec 28800
-auth-user-pass" > /etc/openvpn/server/client-common.txt
+reneg-sec 28800" > /etc/openvpn/server/client-common.txt
 	# Enable and start the OpenVPN service
 	systemctl enable --now openvpn-server@server.service
 	# Generates the custom client.ovpn
